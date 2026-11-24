@@ -19,9 +19,9 @@ package router
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -33,19 +33,12 @@ import (
 
 	flaggerv1 "github.com/fluxcd/flagger/pkg/apis/flagger/v1beta1"
 	"github.com/fluxcd/flagger/pkg/apis/gatewayapi/v1beta1"
-	istiov1beta1 "github.com/fluxcd/flagger/pkg/apis/istio/v1beta1"
 	clientset "github.com/fluxcd/flagger/pkg/client/clientset/versioned"
 )
 
 var (
 	v1beta1PathMatchType    = v1beta1.PathMatchPathPrefix
-	v1beta1PathMatchRegex   = v1beta1.PathMatchRegularExpression
-	v1beta1PathMatchExact   = v1beta1.PathMatchExact
-	v1beta1PathMatchPrefix  = v1beta1.PathMatchPathPrefix
-	v1beta1HeaderMatchExact = v1beta1.HeaderMatchExact
 	v1beta1HeaderMatchRegex = v1beta1.HeaderMatchRegularExpression
-	v1beta1QueryMatchExact  = v1beta1.QueryParamMatchExact
-	v1beta1QueryMatchRegex  = v1beta1.QueryParamMatchRegularExpression
 )
 
 type GatewayAPIV1Beta1Router struct {
@@ -68,10 +61,12 @@ func (gwr *GatewayAPIV1Beta1Router) Reconcile(canary *flaggerv1.Canary) error {
 	for _, host := range canary.Spec.Service.Hosts {
 		hostNames = append(hostNames, v1beta1.Hostname(host))
 	}
-	matches, err := gwr.mapRouteMatches(canary.Spec.Service.Match)
+	serviceMatches, err := translateRouteMatches(canary.Spec.Service.Match)
 	if err != nil {
 		return fmt.Errorf("Invalid request matching selectors: %w", err)
 	}
+	mergeBase := serviceMatches
+	matches := toV1Beta1RouteMatches(serviceMatches)
 	if len(matches) == 0 {
 		matches = append(matches, v1beta1.HTTPRouteMatch{
 			Path: &v1beta1.HTTPPathMatch{
@@ -104,9 +99,15 @@ func (gwr *GatewayAPIV1Beta1Router) Reconcile(canary *flaggerv1.Canary) error {
 
 	// A/B testing
 	if len(canary.GetAnalysis().Match) > 0 {
-		analysisMatches, _ := gwr.mapRouteMatches(canary.GetAnalysis().Match)
-		// serviceMatches, _ := gwr.mapRouteMatches(canary.Spec.Service.Match)
-		httpRouteSpec.Rules[0].Matches = gwr.mergeMatchConditions(analysisMatches, matches)
+		analysisMatches, err := translateRouteMatches(canary.GetAnalysis().Match)
+		if err != nil {
+			return fmt.Errorf("Invalid analysis matching selectors: %w", err)
+		}
+		mergedMatches, err := mergeGatewayMatches(analysisMatches, mergeBase)
+		if err != nil {
+			return fmt.Errorf("Invalid analysis matching selectors: %w", err)
+		}
+		httpRouteSpec.Rules[0].Matches = toV1Beta1RouteMatches(mergedMatches)
 		httpRouteSpec.Rules = append(httpRouteSpec.Rules, v1beta1.HTTPRouteRule{
 			Matches: matches,
 			Filters: gwr.makeFilters(canary),
@@ -173,19 +174,24 @@ func (gwr *GatewayAPIV1Beta1Router) Reconcile(canary *flaggerv1.Canary) error {
 		cmpopts.EquateEmpty(),
 	}
 	if canary.Spec.Analysis.SessionAffinity != nil {
-		ignoreRoute := cmpopts.IgnoreSliceElements(func(r v1beta1.HTTPRouteRule) bool {
-			// Ignore the rule that does sticky routing, i.e. matches against the `Cookie` header.
+		// Ignore the rules that do sticky routing, i.e. rules whose match contains the `Cookie`
+		// header with the regular expression generated for one of the session affinity cookies
+		// tracked in the Canary status. Those rules are produced by SetRoutes and cannot be
+		// derived from the spec alone, so they must not be compared with the desired state.
+		cookieRegexes := sessionAffinityCookieRegexes(canary)
+		ignoreCookieRoutes := cmpopts.IgnoreSliceElements(func(r v1beta1.HTTPRouteRule) bool {
 			for _, match := range r.Matches {
 				for _, headerMatch := range match.Headers {
-					if *headerMatch.Type == v1beta1HeaderMatchRegex && headerMatch.Name == cookieHeader &&
-						strings.Contains(headerMatch.Value, canary.Spec.Analysis.SessionAffinity.CookieName) {
+					if headerMatch.Type != nil && *headerMatch.Type == v1beta1HeaderMatchRegex &&
+						headerMatch.Name == cookieHeader && cookieRegexes[headerMatch.Value] {
 						return true
 					}
 				}
 			}
 			return false
 		})
-		ignoreCmpOptions = append(ignoreCmpOptions, ignoreRoute)
+
+		ignoreCmpOptions = append(ignoreCmpOptions, ignoreCookieRoutes)
 		// Ignore backend specific filters, since we use that to insert the `Set-Cookie` header in responses.
 		ignoreCmpOptions = append(ignoreCmpOptions, cmpopts.IgnoreFields(v1beta1.HTTPBackendRef{}, "Filters"))
 	}
@@ -312,10 +318,12 @@ func (gwr *GatewayAPIV1Beta1Router) SetRoutes(
 	for _, host := range canary.Spec.Service.Hosts {
 		hostNames = append(hostNames, v1beta1.Hostname(host))
 	}
-	matches, err := gwr.mapRouteMatches(canary.Spec.Service.Match)
+	serviceMatches, err := translateRouteMatches(canary.Spec.Service.Match)
 	if err != nil {
 		return fmt.Errorf("Invalid request matching selectors: %w", err)
 	}
+	mergeBase := serviceMatches
+	matches := toV1Beta1RouteMatches(serviceMatches)
 	if len(matches) == 0 {
 		matches = append(matches, v1beta1.HTTPRouteMatch{
 			Path: &v1beta1.HTTPPathMatch{
@@ -373,11 +381,27 @@ func (gwr *GatewayAPIV1Beta1Router) SetRoutes(
 
 	hrClone.Spec = httpRouteSpec
 
+	// The weighted routing rule is the one that carries the A/B match conditions. With
+	// session affinity the sticky rules come first and the weighted rule is last, so it
+	// cannot be addressed by a fixed index.
+	weightedRuleIndex := 0
+	if canary.Spec.Analysis.SessionAffinity != nil {
+		weightedRuleIndex = len(hrClone.Spec.Rules) - 1
+	}
+
 	// A/B testing
 	if len(canary.GetAnalysis().Match) > 0 {
-		analysisMatches, _ := gwr.mapRouteMatches(canary.GetAnalysis().Match)
-		hrClone.Spec.Rules[0].Matches = gwr.mergeMatchConditions(analysisMatches, matches)
-		hrClone.Spec.Rules = append(hrClone.Spec.Rules, v1beta1.HTTPRouteRule{
+		analysisMatches, err := translateRouteMatches(canary.GetAnalysis().Match)
+		if err != nil {
+			return fmt.Errorf("Invalid analysis matching selectors: %w", err)
+		}
+		mergedMatches, err := mergeGatewayMatches(analysisMatches, mergeBase)
+		if err != nil {
+			return fmt.Errorf("Invalid analysis matching selectors: %w", err)
+		}
+		hrClone.Spec.Rules[weightedRuleIndex].Matches = toV1Beta1RouteMatches(mergedMatches)
+
+		primaryOnlyRule := v1beta1.HTTPRouteRule{
 			Matches: matches,
 			Filters: gwr.makeFilters(canary),
 			BackendRefs: []v1beta1.HTTPBackendRef{
@@ -385,7 +409,8 @@ func (gwr *GatewayAPIV1Beta1Router) SetRoutes(
 					BackendRef: gwr.makeBackendRef(primarySvcName, initialPrimaryWeight, canary.Spec.Service.Port),
 				},
 			},
-		})
+		}
+		hrClone.Spec.Rules = append(hrClone.Spec.Rules, primaryOnlyRule)
 	}
 
 	_, err = gwr.gatewayAPIClient.GatewayapiV1beta1().HTTPRoutes(hrNamespace).Update(context.TODO(), hrClone, metav1.UpdateOptions{})
@@ -414,8 +439,12 @@ func (gwr *GatewayAPIV1Beta1Router) getSessionAffinityRouteRules(canary *flagger
 		if canary.Status.SessionAffinityCookie == "" {
 			canary.Status.SessionAffinityCookie = fmt.Sprintf("%s=%s", canary.Spec.Analysis.SessionAffinity.CookieName, randSeq())
 		}
+		if canary.Spec.Analysis.SessionAffinity.PrimaryCookieName != "" &&
+			canary.Status.PrimarySessionAffinityCookie == "" {
+			canary.Status.PrimarySessionAffinityCookie = fmt.Sprintf("%s=%s", canary.Spec.Analysis.SessionAffinity.PrimaryCookieName, randSeq())
+		}
 
-		// Add `Set-Cookie` header modifier to the primary backend in the weighted routing rule.
+		// Add `Set-Cookie` header modifier to the canary backend in the weighted routing rule.
 		for i, backendRef := range weightedRouteRule.BackendRefs {
 			if string(backendRef.BackendObjectReference.Name) == canarySvcName {
 				backendRef.Filters = append(backendRef.Filters, v1beta1.HTTPRouteFilter{
@@ -433,27 +462,48 @@ func (gwr *GatewayAPIV1Beta1Router) getSessionAffinityRouteRules(canary *flagger
 			weightedRouteRule.BackendRefs[i] = backendRef
 		}
 
-		// Add `Cookie` header matcher to the sticky routing rule.
-		cookieKeyAndVal := strings.Split(canary.Status.SessionAffinityCookie, "=")
-		regexMatchType := v1beta1.HeaderMatchRegularExpression
-		cookieMatch := v1beta1.HTTPRouteMatch{
-			Headers: []v1beta1.HTTPHeaderMatch{
-				{
-					Type:  &regexMatchType,
-					Name:  cookieHeader,
-					Value: fmt.Sprintf(".*%s.*%s.*", cookieKeyAndVal[0], cookieKeyAndVal[1]),
-				},
-			},
+		// Add the primary cookie to the primary backend in the weighted routing rule, only if a
+		// primary cookie name has been specified.
+		if canary.Spec.Analysis.SessionAffinity.PrimaryCookieName != "" {
+			interval, err := time.ParseDuration(canary.Spec.Analysis.Interval)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse canary interval: %w", err)
+			}
+			for i, backendRef := range weightedRouteRule.BackendRefs {
+				if string(backendRef.BackendObjectReference.Name) == primarySvcName {
+					backendRef.Filters = append(backendRef.Filters, v1beta1.HTTPRouteFilter{
+						Type: v1beta1.HTTPRouteFilterResponseHeaderModifier,
+						ResponseHeaderModifier: &v1beta1.HTTPHeaderFilter{
+							Add: []v1beta1.HTTPHeader{
+								{
+									Name:  setCookieHeader,
+									Value: canary.Spec.Analysis.SessionAffinity.BuildCookie(canary.Status.PrimarySessionAffinityCookie, int(interval.Seconds())),
+								},
+							},
+						},
+					})
+				}
+				weightedRouteRule.BackendRefs[i] = backendRef
+			}
 		}
 
-		svcMatches, err := gwr.mapRouteMatches(canary.Spec.Service.Match)
+		svcMatches, err := translateRouteMatches(canary.Spec.Service.Match)
 		if err != nil {
 			return nil, err
 		}
 
-		mergedMatches := gwr.mergeMatchConditions([]v1beta1.HTTPRouteMatch{cookieMatch}, svcMatches)
-		stickyRouteRule.Matches = mergedMatches
-		stickyRouteRule.BackendRefs = []v1beta1.HTTPBackendRef{
+		// Add `Cookie` header matcher to the sticky routing rule.
+		cookieMatch, err := sessionAffinityCookieMatch(canary.Status.SessionAffinityCookie)
+		if err != nil {
+			return nil, err
+		}
+		mergedMatches, err := mergeGatewayMatches([]gatewayMatch{cookieMatch}, svcMatches)
+		if err != nil {
+			return nil, err
+		}
+		stickyCanaryRouteRule := *weightedRouteRule
+		stickyCanaryRouteRule.Matches = toV1Beta1RouteMatches(mergedMatches)
+		stickyCanaryRouteRule.BackendRefs = []v1beta1.HTTPBackendRef{
 			{
 				BackendRef: gwr.makeBackendRef(primarySvcName, 0, canary.Spec.Service.Port),
 			},
@@ -461,6 +511,32 @@ func (gwr *GatewayAPIV1Beta1Router) getSessionAffinityRouteRules(canary *flagger
 				BackendRef: gwr.makeBackendRef(canarySvcName, 100, canary.Spec.Service.Port),
 			},
 		}
+
+		// Configure a sticky rule for the primary cookie, only if a primary cookie name has been
+		// specified.
+		if canary.Spec.Analysis.SessionAffinity.PrimaryCookieName != "" {
+			primaryCookieMatch, err := sessionAffinityCookieMatch(canary.Status.PrimarySessionAffinityCookie)
+			if err != nil {
+				return nil, err
+			}
+			mergedMatches, err := mergeGatewayMatches([]gatewayMatch{primaryCookieMatch}, svcMatches)
+			if err != nil {
+				return nil, err
+			}
+			stickyPrimaryRouteRule := *weightedRouteRule
+			stickyPrimaryRouteRule.Matches = toV1Beta1RouteMatches(mergedMatches)
+			stickyPrimaryRouteRule.BackendRefs = []v1beta1.HTTPBackendRef{
+				{
+					BackendRef: gwr.makeBackendRef(primarySvcName, 100, canary.Spec.Service.Port),
+				},
+				{
+					BackendRef: gwr.makeBackendRef(canarySvcName, 0, canary.Spec.Service.Port),
+				},
+			}
+			return []v1beta1.HTTPRouteRule{stickyCanaryRouteRule, stickyPrimaryRouteRule, *weightedRouteRule}, nil
+		}
+
+		return []v1beta1.HTTPRouteRule{stickyCanaryRouteRule, *weightedRouteRule}, nil
 	} else {
 		// If canary weight is 0 and SessionAffinityCookie is non-blank, then it belongs to a previous canary run.
 		if canary.Status.SessionAffinityCookie != "" {
@@ -468,118 +544,53 @@ func (gwr *GatewayAPIV1Beta1Router) getSessionAffinityRouteRules(canary *flagger
 		}
 		previousCookie := canary.Status.PreviousSessionAffinityCookie
 
+		// The analysis has finished (either promoted or rolled back): both cookies must be
+		// invalidated, otherwise clients that were pinned to the canary keep sending a cookie
+		// for which no sticky rule exists anymore.
+		cookiesToExpire := []string{}
+		if previousCookie != "" {
+			cookiesToExpire = append(cookiesToExpire, previousCookie)
+		}
+		if canary.Status.PrimarySessionAffinityCookie != "" {
+			cookiesToExpire = append(cookiesToExpire, canary.Status.PrimarySessionAffinityCookie)
+		}
+
 		// Match against the previous session cookie and delete that cookie
 		if previousCookie != "" {
-			cookieKeyAndVal := strings.Split(previousCookie, "=")
-			regexMatchType := v1beta1.HeaderMatchRegularExpression
-			cookieMatch := v1beta1.HTTPRouteMatch{
-				Headers: []v1beta1.HTTPHeaderMatch{
-					{
-						Type:  &regexMatchType,
-						Name:  cookieHeader,
-						Value: fmt.Sprintf(".*%s.*%s.*", cookieKeyAndVal[0], cookieKeyAndVal[1]),
-					},
-				},
+			cookieMatch, err := sessionAffinityCookieMatch(previousCookie)
+			if err != nil {
+				return nil, err
 			}
-			svcMatches, _ := gwr.mapRouteMatches(canary.Spec.Service.Match)
-			mergedMatches := gwr.mergeMatchConditions([]v1beta1.HTTPRouteMatch{cookieMatch}, svcMatches)
-			stickyRouteRule.Matches = mergedMatches
+			svcMatches, err := translateRouteMatches(canary.Spec.Service.Match)
+			if err != nil {
+				return nil, err
+			}
+			mergedMatches, err := mergeGatewayMatches([]gatewayMatch{cookieMatch}, svcMatches)
+			if err != nil {
+				return nil, err
+			}
+			stickyRouteRule.Matches = toV1Beta1RouteMatches(mergedMatches)
 
+			expireHeaders := make([]v1beta1.HTTPHeader, 0, len(cookiesToExpire))
+			for _, cookie := range cookiesToExpire {
+				expireHeaders = append(expireHeaders, v1beta1.HTTPHeader{
+					Name:  setCookieHeader,
+					Value: fmt.Sprintf("%s; %s=%d", cookie, maxAgeAttr, -1),
+				})
+			}
 			stickyRouteRule.Filters = append(stickyRouteRule.Filters, v1beta1.HTTPRouteFilter{
 				Type: v1beta1.HTTPRouteFilterResponseHeaderModifier,
 				ResponseHeaderModifier: &v1beta1.HTTPHeaderFilter{
-					Add: []v1beta1.HTTPHeader{
-						{
-							Name:  setCookieHeader,
-							Value: fmt.Sprintf("%s; %s=%d", previousCookie, maxAgeAttr, -1),
-						},
-					},
+					Add: expireHeaders,
 				},
 			})
 		}
 
 		canary.Status.SessionAffinityCookie = ""
+		canary.Status.PrimarySessionAffinityCookie = ""
 	}
 
 	return []v1beta1.HTTPRouteRule{stickyRouteRule, *weightedRouteRule}, nil
-}
-
-func (gwr *GatewayAPIV1Beta1Router) mapRouteMatches(requestMatches []istiov1beta1.HTTPMatchRequest) ([]v1beta1.HTTPRouteMatch, error) {
-	matches := []v1beta1.HTTPRouteMatch{}
-
-	for _, requestMatch := range requestMatches {
-		match := v1beta1.HTTPRouteMatch{}
-		if requestMatch.Uri != nil {
-			if requestMatch.Uri.Regex != "" {
-				match.Path = &v1beta1.HTTPPathMatch{
-					Type:  &v1beta1PathMatchRegex,
-					Value: &requestMatch.Uri.Regex,
-				}
-			} else if requestMatch.Uri.Exact != "" {
-				match.Path = &v1beta1.HTTPPathMatch{
-					Type:  &v1beta1PathMatchExact,
-					Value: &requestMatch.Uri.Exact,
-				}
-			} else if requestMatch.Uri.Prefix != "" {
-				match.Path = &v1beta1.HTTPPathMatch{
-					Type:  &v1beta1PathMatchPrefix,
-					Value: &requestMatch.Uri.Prefix,
-				}
-			} else {
-				return nil, fmt.Errorf("Gateway API doesn't support the specified path matching selector: %+v\n", requestMatch.Uri)
-			}
-		}
-		if requestMatch.Method != nil {
-			if requestMatch.Method.Exact != "" {
-				method := v1beta1.HTTPMethod(requestMatch.Method.Exact)
-				match.Method = &method
-			} else {
-				return nil, fmt.Errorf("Gateway API doesn't support the specified header matching selector: %+v\n", requestMatch.Headers)
-			}
-		}
-		for key, val := range requestMatch.Headers {
-			headerMatch := v1beta1.HTTPHeaderMatch{}
-			if val.Exact != "" {
-				headerMatch.Name = v1beta1.HTTPHeaderName(key)
-				headerMatch.Type = &v1beta1HeaderMatchExact
-				headerMatch.Value = val.Exact
-			} else if val.Regex != "" {
-				headerMatch.Name = v1beta1.HTTPHeaderName(key)
-				headerMatch.Type = &v1beta1HeaderMatchRegex
-				headerMatch.Value = val.Regex
-			} else {
-				return nil, fmt.Errorf("Gateway API doesn't support the specified header matching selector: %+v\n", requestMatch.Headers)
-			}
-			if (v1beta1.HTTPHeaderMatch{} != headerMatch) {
-				match.Headers = append(match.Headers, headerMatch)
-			}
-		}
-
-		for key, val := range requestMatch.QueryParams {
-			queryMatch := v1beta1.HTTPQueryParamMatch{}
-			if val.Exact != "" {
-				queryMatch.Name = key
-				queryMatch.Type = &v1beta1QueryMatchExact
-				queryMatch.Value = val.Exact
-			} else if val.Regex != "" {
-				queryMatch.Name = key
-				queryMatch.Type = &v1beta1QueryMatchRegex
-				queryMatch.Value = val.Regex
-			} else {
-				return nil, fmt.Errorf("Gateway API doesn't support the specified query matching selector: %+v\n", requestMatch.QueryParams)
-			}
-
-			if (v1beta1.HTTPQueryParamMatch{} != queryMatch) {
-				match.QueryParams = append(match.QueryParams, queryMatch)
-			}
-		}
-
-		if !reflect.DeepEqual(match, v1beta1.HTTPRouteMatch{}) {
-			matches = append(matches, match)
-		}
-	}
-
-	return matches, nil
 }
 
 func (gwr *GatewayAPIV1Beta1Router) makeBackendRef(svcName string, weight, port int32) v1beta1.BackendRef {
@@ -592,31 +603,6 @@ func (gwr *GatewayAPIV1Beta1Router) makeBackendRef(svcName string, weight, port 
 		},
 		Weight: &weight,
 	}
-}
-
-func (gwr *GatewayAPIV1Beta1Router) mergeMatchConditions(analysis, service []v1beta1.HTTPRouteMatch) []v1beta1.HTTPRouteMatch {
-	if len(analysis) == 0 {
-		return service
-	}
-	if len(service) == 0 {
-		return analysis
-	}
-
-	merged := make([]v1beta1.HTTPRouteMatch, len(service)*len(analysis))
-	num := 0
-	for _, a := range analysis {
-		for _, s := range service {
-			merged[num] = *s.DeepCopy()
-			if len(a.Headers) > 0 {
-				merged[num].Headers = a.Headers
-			}
-			if len(a.QueryParams) > 0 {
-				merged[num].QueryParams = a.QueryParams
-			}
-			num++
-		}
-	}
-	return merged
 }
 
 func sortFiltersV1beta1(headers []v1beta1.HTTPHeader) {

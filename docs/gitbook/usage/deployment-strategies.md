@@ -294,6 +294,30 @@ curl -H 'X-Canary: insider' http://app.example.com
 curl -b 'canary=always' http://app.example.com
 ```
 
+### How `analysis.match` is combined with `service.match`
+
+When both `service.match` (the conditions every request must satisfy to reach the
+application) and `analysis.match` (the A/B conditions) are set, Flagger combines
+them per match pair:
+
+* **headers and query parameters are unioned by name.** A request must satisfy
+  both sets. If the same header (names are case-insensitive) or query parameter
+  is required with two different values, the combination is impossible and the
+  Canary is rejected rather than silently dropping one of the conditions.
+* **path and method are taken from whichever side defines them.** If both sides
+  define one and they differ (e.g. `exact: /api` in the analysis and
+  `prefix: /api` in the service), the Canary is rejected.
+* Unsupported selectors (header prefix/suffix matches, presence-only matches,
+  non-exact methods) are rejected with an error instead of being dropped.
+
+Example: with `service.match: {headers: {x-tenant: {exact: acme}}}` and
+`analysis.match: {headers: {x-canary: {exact: always}}}`, the A/B rule requires
+**both** `x-tenant: acme` and `x-canary: always`; a request carrying only
+`x-canary` does not enter the canary.
+
+This merging applies to the Gateway API provider. The same rules are used by the
+`gatewayapi/v1` and `gatewayapi/v1beta1` implementations.
+
 ## Blue/Green Deployments
 
 For applications that are not deployed on a service mesh,
@@ -443,7 +467,10 @@ have the following header:
 Set-Cookie: flagger-cookie=LpsIaLdoNZ; Max-Age=-1
 ```
 This tells the client to delete the cookie, making sure there are no junk cookies lying around in the user's
-system.
+system. When a primary cookie is configured, it is expired in the same way at the end of the run.
+
+Clients are matched by an exact `cookieName=cookieValue` pair: the value must appear as a complete
+cookie in the `Cookie` header, so `xflagger-cookie=...` or a value with the same prefix does not match.
 
 If a new Canary run is triggered, the response header will set a new cookie for all requests routed to
 the Canary deployment:

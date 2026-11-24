@@ -402,7 +402,12 @@ func verifyKnativeCanary(canary *flaggerv1.Canary) error {
 
 func verifySessionAffinity(canary *flaggerv1.Canary) error {
 	if canary.Spec.Analysis.SessionAffinity != nil {
-		if canary.Spec.Analysis.SessionAffinity.CookieName == canary.Spec.Analysis.SessionAffinity.PrimaryCookieName {
+		cookieName := canary.Spec.Analysis.SessionAffinity.CookieName
+		primaryCookieName := canary.Spec.Analysis.SessionAffinity.PrimaryCookieName
+		// PrimaryCookieName is optional: when it is empty only the canary session
+		// affinity cookie is used. Only reject a configuration where both names are
+		// set and identical, since a single cookie cannot carry both roles.
+		if cookieName != "" && primaryCookieName != "" && cookieName == primaryCookieName {
 			return fmt.Errorf("can't use the same cookie name for both primary and cookie name; please update them to be different")
 		}
 	}

@@ -208,6 +208,56 @@ func TestController_verifyCanary(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "session affinity without a primary cookie name is allowed",
+			canary: flaggerv1.Canary{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cd-1",
+					Namespace: "default",
+				},
+				Spec: flaggerv1.CanarySpec{
+					Analysis: &flaggerv1.CanaryAnalysis{
+						SessionAffinity: &flaggerv1.SessionAffinity{
+							CookieName: "smth",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "session affinity with an empty cookie name and an empty primary cookie name is allowed",
+			canary: flaggerv1.Canary{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cd-1",
+					Namespace: "default",
+				},
+				Spec: flaggerv1.CanarySpec{
+					Analysis: &flaggerv1.CanaryAnalysis{
+						SessionAffinity: &flaggerv1.SessionAffinity{},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "session affinity with different cookie names is allowed",
+			canary: flaggerv1.Canary{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cd-1",
+					Namespace: "default",
+				},
+				Spec: flaggerv1.CanarySpec{
+					Analysis: &flaggerv1.CanaryAnalysis{
+						SessionAffinity: &flaggerv1.SessionAffinity{
+							CookieName:        "canary",
+							PrimaryCookieName: "primary",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
 	}
 
 	ctrl := &Controller{
